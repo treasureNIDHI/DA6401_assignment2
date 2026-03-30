@@ -12,6 +12,7 @@ class VGG11Encoder(nn.Module):
     """
 
     def __init__(self, in_channels: int = 3):
+        """Initialize the VGG11Encoder model."""
         pass
 
     def forward(
