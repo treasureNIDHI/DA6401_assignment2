@@ -1,18 +1,15 @@
-"""Dataset skeleton for Oxford-IIIT Pet.
-"""
-
-from torch.utils.data import Dataset
 import os
 import torch
 import numpy as np
 from PIL import Image
 import xml.etree.ElementTree as ET
+import torchvision.transforms as transforms
+
+from torch.utils.data import Dataset
 
 
-
-   
 class OxfordIIITPetDataset(Dataset):
-    def __init__(self, root, split="train", transform=None):
+    def __init__(self, root, split="trainval", transform=None):
         self.root = root
         self.split = split
         self.transform = transform
@@ -24,7 +21,21 @@ class OxfordIIITPetDataset(Dataset):
         split_file = os.path.join(root, "annotations", f"{split}.txt")
 
         with open(split_file) as f:
-            self.samples = [line.strip().split()[0] for line in f.readlines()]
+            # self.samples = [line.strip().split()[0] for line in f.readlines()]
+            samples = [line.strip().split()[0] for line in f.readlines()]
+
+            # remove samples without xml
+            self.samples = []
+            for s in samples:
+                xml_path = os.path.join(self.xml_dir, s + ".xml")
+                if os.path.exists(xml_path):
+                    self.samples.append(s)
+
+        self.to_tensor = transforms.ToTensor()
+
+        # create breed mapping
+        breeds = sorted(set("_".join(s.split("_")[:-1]) for s in self.samples))
+        self.breed_to_idx = {b: i for i, b in enumerate(breeds)}
 
     def __len__(self):
         return len(self.samples)
@@ -39,11 +50,13 @@ class OxfordIIITPetDataset(Dataset):
 
         # IMAGE
         image = Image.open(img_path).convert("RGB")
+        image = image.resize((224,224))
+        image = self.to_tensor(image)
 
         # MASK
-        mask = Image.open(mask_path)
+        mask = Image.open(mask_path).resize((224,224))
         mask = np.array(mask)
-        mask = (mask == 1).astype(np.float32)  # pet = 1
+        mask = (mask == 1).astype(np.float32)
         mask = torch.tensor(mask)
 
         # BBOX
@@ -65,12 +78,9 @@ class OxfordIIITPetDataset(Dataset):
 
         bbox = torch.tensor([x_center, y_center, width, height], dtype=torch.float32)
 
-        # LABEL (breed index)
-        label = int(name.split("_")[-1]) - 1
-        label = torch.tensor(label)
-
-        if self.transform:
-            image = self.transform(image)
+        # LABEL
+        breed = "_".join(name.split("_")[:-1])
+        label = torch.tensor(self.breed_to_idx[breed])
 
         return {
             "image": image,

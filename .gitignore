@@ -1,0 +1,7 @@
+env2/
+data/annotations/
+data/images/
+env_gpu/
+checkpoints/*.pth
+__pycache__/
+test_*.py
