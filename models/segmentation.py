@@ -62,7 +62,7 @@ class VGG11UNet(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        self.final = nn.Conv2d(64, 1, 1)
+        self.final = nn.Conv2d(64, num_classes, 1)
 
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

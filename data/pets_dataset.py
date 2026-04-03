@@ -50,14 +50,17 @@ class OxfordIIITPetDataset(Dataset):
 
         # IMAGE
         image = Image.open(img_path).convert("RGB")
+        original_width, original_height = image.size
         image = image.resize((224,224))
-        image = self.to_tensor(image)
+        if self.transform is not None:
+            image = self.transform(image)
+        else:
+            image = self.to_tensor(image)
 
         # MASK
-        mask = Image.open(mask_path).resize((224,224))
-        mask = np.array(mask)
-        mask = (mask == 1).astype(np.float32)
-        mask = torch.tensor(mask)
+        mask = Image.open(mask_path).resize((224,224), resample=Image.NEAREST)
+        mask = np.array(mask, dtype=np.int64) - 1
+        mask = torch.tensor(mask, dtype=torch.long)
 
         # BBOX
         tree = ET.parse(xml_path)
@@ -69,6 +72,14 @@ class OxfordIIITPetDataset(Dataset):
         ymin = float(bbox.find("ymin").text)
         xmax = float(bbox.find("xmax").text)
         ymax = float(bbox.find("ymax").text)
+
+        scale_x = 224.0 / float(original_width)
+        scale_y = 224.0 / float(original_height)
+
+        xmin *= scale_x
+        xmax *= scale_x
+        ymin *= scale_y
+        ymax *= scale_y
 
         # convert to center format
         x_center = (xmin + xmax) / 2

@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split
 
 from data.pets_dataset import OxfordIIITPetDataset
@@ -8,8 +9,43 @@ from models.segmentation import VGG11UNet
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+IMAGE_MEAN = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+IMAGE_STD = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+
+
+def normalize_images(images: torch.Tensor) -> torch.Tensor:
+    return (images - IMAGE_MEAN) / IMAGE_STD
+
+
+def load_checkpoint(path: str, map_location: torch.device):
+    try:
+        checkpoint = torch.load(path, map_location=map_location, weights_only=True)
+    except TypeError:
+        checkpoint = torch.load(path, map_location=map_location)
+    if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+        return checkpoint["state_dict"]
+    return checkpoint
+
+
+def seed_everything(seed: int = 42):
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def multiclass_dice_loss(logits: torch.Tensor, targets: torch.Tensor, num_classes: int = 3, eps: float = 1e-6) -> torch.Tensor:
+    probs = torch.softmax(logits, dim=1)
+    target_onehot = F.one_hot(targets, num_classes=num_classes).permute(0, 3, 1, 2).float()
+
+    intersection = (probs * target_onehot).sum(dim=(0, 2, 3))
+    denom = probs.sum(dim=(0, 2, 3)) + target_onehot.sum(dim=(0, 2, 3))
+
+    dice = (2.0 * intersection + eps) / (denom + eps)
+    return 1.0 - dice.mean()
+
 
 def train():
+    seed_everything(42)
 
     # -----------------------------
     # DATASET (STRICT ISOLATION)
@@ -50,17 +86,20 @@ def train():
     model = VGG11UNet().to(device)
 
     # load pretrained encoder
-    checkpoint = torch.load("checkpoints/classifier.pth", map_location=device)
-    model.encoder.load_state_dict(checkpoint["state_dict"], strict=False)
+    checkpoint = load_checkpoint("checkpoints/classifier.pth", map_location=device)
+    model.encoder.load_state_dict(checkpoint, strict=False)
 
     # -----------------------------
     # LOSS
     # -----------------------------
-    criterion = nn.BCEWithLogitsLoss()
+    criterion_ce = nn.CrossEntropyLoss()
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=15, eta_min=1e-6)
+    use_amp = device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
-    epochs = 10
+    epochs = 15
     best_loss = float("inf")
 
     for epoch in range(epochs):
@@ -73,15 +112,22 @@ def train():
 
         for batch in train_loader:
 
-            images = batch["image"].to(device)
-            masks = batch["mask"].unsqueeze(1).to(device)
+            images = normalize_images(batch["image"].to(device))
+            masks = batch["mask"].long().to(device)
 
-            preds = model(images)
-            loss = criterion(preds, masks)
+            optimizer.zero_grad(set_to_none=True)
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                preds = model(images)
+                loss_ce = criterion_ce(preds, masks)
+                loss_dice = multiclass_dice_loss(preds, masks, num_classes=3)
+                loss = loss_ce + loss_dice
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
 
             train_loss += loss.item()
 
@@ -95,11 +141,14 @@ def train():
 
             for batch in val_loader:
 
-                images = batch["image"].to(device)
-                masks = batch["mask"].unsqueeze(1).to(device)
+                images = normalize_images(batch["image"].to(device))
+                masks = batch["mask"].long().to(device)
 
-                preds = model(images)
-                loss = criterion(preds, masks)
+                with torch.amp.autocast("cuda", enabled=use_amp):
+                    preds = model(images)
+                    loss_ce = criterion_ce(preds, masks)
+                    loss_dice = multiclass_dice_loss(preds, masks, num_classes=3)
+                    loss = loss_ce + loss_dice
 
                 val_loss += loss.item()
 
@@ -109,6 +158,9 @@ def train():
         print(f"\nEpoch {epoch+1}/{epochs}")
         print("Train Loss:", train_loss)
         print("Val Loss:", val_loss)
+        print("LR:", optimizer.param_groups[0]["lr"])
+
+        scheduler.step()
 
         # -----------------------------
         # SAVE BEST MODEL

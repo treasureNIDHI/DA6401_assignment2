@@ -8,8 +8,28 @@ from models.classification import VGG11Classifier
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+IMAGE_MEAN = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+IMAGE_STD = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+
+
+def normalize_images(images: torch.Tensor) -> torch.Tensor:
+    return (images - IMAGE_MEAN) / IMAGE_STD
+
+
+def seed_everything(seed: int = 42):
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def augment_classification_batch(images: torch.Tensor) -> torch.Tensor:
+    if torch.rand(1).item() < 0.5:
+        images = torch.flip(images, dims=[3])
+    return images
+
 
 def train():
+    seed_everything(42)
 
     # -----------------------------
     # DATASET (STRICT ISOLATION)
@@ -58,9 +78,12 @@ def train():
     # -----------------------------
     # OPTIMIZER
     # -----------------------------
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=20, eta_min=1e-6)
+    use_amp = device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
-    epochs = 10
+    epochs = 20
     best_acc = 0
 
     for epoch in range(epochs):
@@ -74,14 +97,21 @@ def train():
         for batch in train_loader:
 
             images = batch["image"].to(device)
+            images = augment_classification_batch(images)
+            images = normalize_images(images)
             labels = batch["label"].to(device)
 
-            outputs = model(images)
-            loss = criterion(outputs, labels)
+            optimizer.zero_grad(set_to_none=True)
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                outputs = model(images)
+                loss = criterion(outputs, labels)
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
 
             train_loss += loss.item()
 
@@ -97,11 +127,12 @@ def train():
 
             for batch in val_loader:
 
-                images = batch["image"].to(device)
+                images = normalize_images(batch["image"].to(device))
                 labels = batch["label"].to(device)
 
-                outputs = model(images)
-                loss = criterion(outputs, labels)
+                with torch.amp.autocast("cuda", enabled=use_amp):
+                    outputs = model(images)
+                    loss = criterion(outputs, labels)
 
                 val_loss += loss.item()
 
@@ -115,6 +146,9 @@ def train():
         print("Train Loss:", train_loss / len(train_loader))
         print("Val Loss:", val_loss / len(val_loader))
         print("Val Acc:", acc)
+        print("LR:", optimizer.param_groups[0]["lr"])
+
+        scheduler.step()
 
         # -----------------------------
         # SAVE BEST MODEL

@@ -6,6 +6,8 @@ from typing import Dict, Tuple, Union
 import torch
 import torch.nn as nn
 
+from .layers import CustomDropout
+
 
 class VGG11Encoder(nn.Module):
     """VGG11-style encoder with optional intermediate feature returns.
@@ -97,3 +99,29 @@ class VGG11Encoder(nn.Module):
             return bottleneck, features
 
         return bottleneck
+
+
+def _make_classifier_head(num_classes: int, dropout_p: float) -> nn.Sequential:
+    return nn.Sequential(
+        nn.Flatten(),
+        nn.Linear(512 * 7 * 7, 4096),
+        nn.ReLU(inplace=True),
+        CustomDropout(dropout_p),
+        nn.Linear(4096, 4096),
+        nn.ReLU(inplace=True),
+        CustomDropout(dropout_p),
+        nn.Linear(4096, num_classes),
+    )
+
+
+class VGG11(nn.Module):
+    """Full VGG11 classifier with a custom dropout head."""
+
+    def __init__(self, num_classes: int = 37, in_channels: int = 3, dropout_p: float = 0.5):
+        super().__init__()
+        self.encoder = VGG11Encoder(in_channels)
+        self.classifier = _make_classifier_head(num_classes, dropout_p)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.encoder(x)
+        return self.classifier(x)
