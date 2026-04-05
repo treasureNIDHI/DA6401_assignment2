@@ -3,7 +3,7 @@
 
 import torch
 import torch.nn as nn
-
+import gdown
 from .layers import CustomDropout
 from .vgg11 import VGG11Encoder
 
@@ -166,6 +166,9 @@ class MultiTaskPerceptionModel(nn.Module):
             unet_path: Path to trained unet weights.
         """
         super().__init__()
+        gdown.download(id="1_D01Ldt-jrTMXYSe_vExxgslwJIUe71G", output=classifier_path, quiet=False)
+        gdown.download(id="1EduqnUeDP86NBl8WlrSinlhL_foUz2z5", output=localizer_path, quiet=False)
+        gdown.download(id="1GSu2rTMvMwOsQVM92NKX0L0NmGzpt765", output=unet_path, quiet=False)
 
         self.encoder = VGG11Encoder(in_channels)
         self.classifier_head = _ClassificationHead(num_breeds)
