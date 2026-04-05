@@ -5,3 +5,5 @@ env_gpu/
 checkpoints/*.pth
 __pycache__/
 test_*.py
+test_images/
+wandb/

@@ -9,63 +9,49 @@ import torch.nn as nn
 from .layers import CustomDropout
 
 
-class VGG11Encoder(nn.Module):
-    """VGG11-style encoder with optional intermediate feature returns.
-    """
+def conv_block(in_c, out_c, use_bn):
+    layers = [nn.Conv2d(in_c, out_c, 3, padding=1)]
 
-    def __init__(self, in_channels: int = 3):
-        """Initialize the VGG11Encoder model."""
+    if use_bn:
+        layers.append(nn.BatchNorm2d(out_c))
+
+    layers.append(nn.ReLU(inplace=True))
+
+    return nn.Sequential(*layers)
+
+
+class VGG11Encoder(nn.Module):
+    """VGG11-style encoder"""
+
+    def __init__(self, in_channels: int = 3, use_batchnorm: bool = True):
         super().__init__()
 
         # block1
-        self.block1 = nn.Sequential(
-            nn.Conv2d(in_channels, 64, 3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-        )
+        self.block1 = conv_block(in_channels, 64, use_batchnorm)
         self.pool1 = nn.MaxPool2d(2,2)
 
         # block2
-        self.block2 = nn.Sequential(
-            nn.Conv2d(64, 128, 3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-        )
+        self.block2 = conv_block(64, 128, use_batchnorm)
         self.pool2 = nn.MaxPool2d(2,2)
 
         # block3
         self.block3 = nn.Sequential(
-            nn.Conv2d(128, 256, 3, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True),
-
-            nn.Conv2d(256, 256, 3, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True),
+            conv_block(128, 256, use_batchnorm),
+            conv_block(256, 256, use_batchnorm),
         )
         self.pool3 = nn.MaxPool2d(2,2)
 
         # block4
         self.block4 = nn.Sequential(
-            nn.Conv2d(256, 512, 3, padding=1),
-            nn.BatchNorm2d(512),
-            nn.ReLU(inplace=True),
-
-            nn.Conv2d(512, 512, 3, padding=1),
-            nn.BatchNorm2d(512),
-            nn.ReLU(inplace=True),
+            conv_block(256, 512, use_batchnorm),
+            conv_block(512, 512, use_batchnorm),
         )
         self.pool4 = nn.MaxPool2d(2,2)
 
         # block5
         self.block5 = nn.Sequential(
-            nn.Conv2d(512, 512, 3, padding=1),
-            nn.BatchNorm2d(512),
-            nn.ReLU(inplace=True),
-
-            nn.Conv2d(512, 512, 3, padding=1),
-            nn.BatchNorm2d(512),
-            nn.ReLU(inplace=True),
+            conv_block(512, 512, use_batchnorm),
+            conv_block(512, 512, use_batchnorm),
         )
         self.pool5 = nn.MaxPool2d(2,2)
 
@@ -89,19 +75,12 @@ class VGG11Encoder(nn.Module):
         bottleneck = self.pool5(f5)
 
         if return_features:
-            features = {
-                "f1": f1,
-                "f2": f2,
-                "f3": f3,
-                "f4": f4,
-                "f5": f5,
-            }
-            return bottleneck, features
+            return bottleneck, {"f1":f1,"f2":f2,"f3":f3,"f4":f4,"f5":f5}
 
         return bottleneck
 
 
-def _make_classifier_head(num_classes: int, dropout_p: float) -> nn.Sequential:
+def _make_classifier_head(num_classes: int, dropout_p: float):
     return nn.Sequential(
         nn.Flatten(),
         nn.Linear(512 * 7 * 7, 4096),
@@ -115,13 +94,19 @@ def _make_classifier_head(num_classes: int, dropout_p: float) -> nn.Sequential:
 
 
 class VGG11(nn.Module):
-    """Full VGG11 classifier with a custom dropout head."""
 
-    def __init__(self, num_classes: int = 37, in_channels: int = 3, dropout_p: float = 0.5):
+    def __init__(
+        self,
+        num_classes: int = 37,
+        in_channels: int = 3,
+        dropout_p: float = 0.5,
+        use_batchnorm: bool = True
+    ):
         super().__init__()
-        self.encoder = VGG11Encoder(in_channels)
+
+        self.encoder = VGG11Encoder(in_channels, use_batchnorm)
         self.classifier = _make_classifier_head(num_classes, dropout_p)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         x = self.encoder(x)
         return self.classifier(x)

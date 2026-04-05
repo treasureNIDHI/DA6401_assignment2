@@ -1,9 +1,10 @@
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, random_split
+import wandb
 
 from data.pets_dataset import OxfordIIITPetDataset
-from models.classification import VGG11Classifier
+from models.vgg11 import VGG11
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -32,12 +33,16 @@ def train():
     seed_everything(42)
 
     # -----------------------------
-    # DATASET (STRICT ISOLATION)
+    # CHANGE ONLY THIS FOR 3 RUNS
+    # -----------------------------
+    dropout_p = 0.5  # run1: 0.0 | run2: 0.2 | run3: 0.5
+
+    # -----------------------------
+    # DATASET
     # -----------------------------
     trainval_dataset = OxfordIIITPetDataset("data", split="trainval")
-    test_dataset = OxfordIIITPetDataset("data", split="test")  # never used for training
+    test_dataset = OxfordIIITPetDataset("data", split="test")
 
-    # deterministic split
     generator = torch.Generator().manual_seed(42)
 
     train_size = int(0.9 * len(trainval_dataset))
@@ -68,7 +73,10 @@ def train():
     # -----------------------------
     # MODEL
     # -----------------------------
-    model = VGG11Classifier().to(device)
+    model = VGG11(
+        dropout_p=dropout_p,
+        use_batchnorm=True
+    ).to(device)
 
     # -----------------------------
     # LOSS
@@ -79,12 +87,32 @@ def train():
     # OPTIMIZER
     # -----------------------------
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=20, eta_min=1e-6)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=20, eta_min=1e-6
+    )
+
     use_amp = device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
-    epochs = 20
-    best_acc = 0
+    epochs = 10
+
+    # -----------------------------
+    # W&B INIT (WITH TAGS)
+    # -----------------------------
+    wandb.init(
+        project="DA6401_A2_Multitask",
+        name=f"dropout_{dropout_p}",
+        tags=["dropout_experiment", f"dropout_{dropout_p}"],
+        config={
+            "model": "VGG11",
+            "dropout": dropout_p,
+            "batchnorm": True,
+            "optimizer": "AdamW",
+            "learning_rate": 1e-4,
+            "batch_size": 16,
+            "epochs": epochs
+        }
+    )
 
     for epoch in range(epochs):
 
@@ -96,9 +124,7 @@ def train():
 
         for batch in train_loader:
 
-            images = batch["image"].to(device)
-            images = augment_classification_batch(images)
-            images = normalize_images(images)
+            images = normalize_images(batch["image"].to(device))
             labels = batch["label"].to(device)
 
             optimizer.zero_grad(set_to_none=True)
@@ -108,8 +134,6 @@ def train():
                 loss = criterion(outputs, labels)
 
             scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
 
@@ -130,9 +154,8 @@ def train():
                 images = normalize_images(batch["image"].to(device))
                 labels = batch["label"].to(device)
 
-                with torch.amp.autocast("cuda", enabled=use_amp):
-                    outputs = model(images)
-                    loss = criterion(outputs, labels)
+                outputs = model(images)
+                loss = criterion(outputs, labels)
 
                 val_loss += loss.item()
 
@@ -140,32 +163,26 @@ def train():
                 total += labels.size(0)
                 correct += (predicted == labels).sum().item()
 
-        acc = 100 * correct / total if total > 0 else 0
+        acc = 100 * correct / total
+
+        train_loss /= len(train_loader)
+        val_loss /= len(val_loader)
 
         print(f"\nEpoch {epoch+1}/{epochs}")
-        print("Train Loss:", train_loss / len(train_loader))
-        print("Val Loss:", val_loss / len(val_loader))
+        print("Train Loss:", train_loss)
+        print("Val Loss:", val_loss)
         print("Val Acc:", acc)
-        print("LR:", optimizer.param_groups[0]["lr"])
+
+        wandb.log({
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "val_accuracy": acc
+        })
 
         scheduler.step()
 
-        # -----------------------------
-        # SAVE BEST MODEL
-        # -----------------------------
-        if acc > best_acc:
-            best_acc = acc
-
-            torch.save(
-                {
-                    "state_dict": model.state_dict(),
-                    "epoch": epoch,
-                    "best_metric": acc,
-                },
-                "checkpoints/classifier.pth"
-            )
-
-            print("Saved classifier checkpoint")
+    wandb.finish()
 
 
 if __name__ == "__main__":

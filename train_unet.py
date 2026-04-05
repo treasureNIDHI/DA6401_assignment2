@@ -2,10 +2,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split
+import wandb
 
 from data.pets_dataset import OxfordIIITPetDataset
 from models.segmentation import VGG11UNet
 
+transfer_type = "full"   # "freeze" | "partial" | "full"
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -48,10 +50,10 @@ def train():
     seed_everything(42)
 
     # -----------------------------
-    # DATASET (STRICT ISOLATION)
+    # DATASET
     # -----------------------------
     trainval_dataset = OxfordIIITPetDataset("data", split="trainval")
-    test_dataset = OxfordIIITPetDataset("data", split="test")  # never used in training
+    test_dataset = OxfordIIITPetDataset("data", split="test")
 
     generator = torch.Generator().manual_seed(42)
 
@@ -85,9 +87,27 @@ def train():
     # -----------------------------
     model = VGG11UNet().to(device)
 
-    # load pretrained encoder
     checkpoint = load_checkpoint("checkpoints/classifier.pth", map_location=device)
     model.encoder.load_state_dict(checkpoint, strict=False)
+
+    # -----------------------------
+    # TRANSFER LEARNING STRATEGY
+    # -----------------------------
+    if transfer_type == "freeze":
+        for param in model.encoder.parameters():
+            param.requires_grad = False
+
+    elif transfer_type == "partial":
+        for param in model.encoder.parameters():
+            param.requires_grad = False
+
+        # unfreeze last block
+        for param in model.encoder.block5.parameters():
+            param.requires_grad = True
+
+    elif transfer_type == "full":
+        for param in model.encoder.parameters():
+            param.requires_grad = True
 
     # -----------------------------
     # LOSS
@@ -102,11 +122,23 @@ def train():
     epochs = 15
     best_loss = float("inf")
 
+    # -----------------------------
+    # W&B
+    # -----------------------------
+    wandb.init(
+        project="DA6401_A2_Multitask",
+        name=f"transfer_{transfer_type}",
+        tags=["transfer_learning", transfer_type],
+        config={
+            "transfer_type": transfer_type,
+            "epochs": epochs,
+            "lr": 2e-4
+        }
+    )
+
     for epoch in range(epochs):
 
-        # -----------------------------
         # TRAIN
-        # -----------------------------
         model.train()
         train_loss = 0
 
@@ -124,16 +156,12 @@ def train():
                 loss = loss_ce + loss_dice
 
             scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
 
             train_loss += loss.item()
 
-        # -----------------------------
         # VALIDATION
-        # -----------------------------
         model.eval()
         val_loss = 0
 
@@ -144,11 +172,10 @@ def train():
                 images = normalize_images(batch["image"].to(device))
                 masks = batch["mask"].long().to(device)
 
-                with torch.amp.autocast("cuda", enabled=use_amp):
-                    preds = model(images)
-                    loss_ce = criterion_ce(preds, masks)
-                    loss_dice = multiclass_dice_loss(preds, masks, num_classes=3)
-                    loss = loss_ce + loss_dice
+                preds = model(images)
+                loss_ce = criterion_ce(preds, masks)
+                loss_dice = multiclass_dice_loss(preds, masks, num_classes=3)
+                loss = loss_ce + loss_dice
 
                 val_loss += loss.item()
 
@@ -158,13 +185,15 @@ def train():
         print(f"\nEpoch {epoch+1}/{epochs}")
         print("Train Loss:", train_loss)
         print("Val Loss:", val_loss)
-        print("LR:", optimizer.param_groups[0]["lr"])
+
+        wandb.log({
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "val_loss": val_loss
+        })
 
         scheduler.step()
 
-        # -----------------------------
-        # SAVE BEST MODEL
-        # -----------------------------
         if val_loss < best_loss:
             best_loss = val_loss
 
@@ -177,7 +206,7 @@ def train():
                 "checkpoints/unet.pth"
             )
 
-            print("Saved UNet checkpoint")
+    wandb.finish()
 
 
 if __name__ == "__main__":
