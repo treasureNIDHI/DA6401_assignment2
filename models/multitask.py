@@ -6,6 +6,8 @@ import torch.nn as nn
 import gdown # pyright: ignore[reportMissingImports]
 from .layers import CustomDropout
 from .vgg11 import VGG11Encoder
+import os
+import sys
 
 
 def _load_checkpoint_state(checkpoint_path: str) -> dict:
