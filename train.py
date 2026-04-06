@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, random_split
 import wandb
+import os
 
 from data.pets_dataset import OxfordIIITPetDataset
 from models.vgg11 import VGG11
@@ -95,6 +96,10 @@ def train():
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     epochs = 10
+    
+    # Ensure checkpoints directory exists
+    os.makedirs("checkpoints", exist_ok=True)
+    best_loss = float("inf")
 
     # -----------------------------
     # W&B INIT (WITH TAGS)
@@ -179,6 +184,19 @@ def train():
             "val_loss": val_loss,
             "val_accuracy": acc
         })
+
+        # Save best checkpoint
+        if val_loss < best_loss:
+            best_loss = val_loss
+            torch.save(
+                {
+                    "state_dict": model.state_dict(),
+                    "epoch": epoch,
+                    "best_metric": val_loss,
+                },
+                "checkpoints/classifier.pth"
+            )
+            print(f"✓ Saved classifier checkpoint (val_loss={val_loss:.4f})")
 
         scheduler.step()
 
