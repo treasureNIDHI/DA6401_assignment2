@@ -198,6 +198,16 @@ class MultiTaskPerceptionModel(nn.Module):
         self.localizer_head = _LocalizationHead()
         self.segmentation_head = _SegmentationDecoder(seg_classes)
 
+        # Match train-time preprocessing in all task scripts.
+        self.register_buffer(
+            "image_mean",
+            torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1),
+        )
+        self.register_buffer(
+            "image_std",
+            torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1),
+        )
+
         # Load pretrained weights
         cls_state = _load_checkpoint_state(classifier_path)
         loc_state = _load_checkpoint_state(localizer_path)
@@ -224,6 +234,7 @@ class MultiTaskPerceptionModel(nn.Module):
             - 'localization': [B, 4] bounding box tensor.
             - 'segmentation': [B, seg_classes, H, W] segmentation logits tensor
         """
+        x = (x - self.image_mean) / self.image_std
         bottleneck, features = self.encoder(x, return_features=True)
 
         cls_logits = self.classifier_head(bottleneck)
