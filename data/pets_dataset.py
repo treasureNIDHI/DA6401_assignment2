@@ -20,22 +20,24 @@ class OxfordIIITPetDataset(Dataset):
 
         split_file = os.path.join(root, "annotations", f"{split}.txt")
 
+        self.samples = []
+        self.sample_to_label = {}
         with open(split_file) as f:
-            # self.samples = [line.strip().split()[0] for line in f.readlines()]
-            samples = [line.strip().split()[0] for line in f.readlines()]
+            # Split file format: image_name class_id species_id breed_id
+            for line in f.readlines():
+                parts = line.strip().split()
+                if len(parts) < 2:
+                    continue
+                sample_name = parts[0]
+                # Official class ids are 1..37; convert to 0..36 for CE loss.
+                class_id = int(parts[1]) - 1
 
-            # remove samples without xml
-            self.samples = []
-            for s in samples:
-                xml_path = os.path.join(self.xml_dir, s + ".xml")
+                xml_path = os.path.join(self.xml_dir, sample_name + ".xml")
                 if os.path.exists(xml_path):
-                    self.samples.append(s)
+                    self.samples.append(sample_name)
+                    self.sample_to_label[sample_name] = class_id
 
         self.to_tensor = transforms.ToTensor()
-
-        # create breed mapping
-        breeds = sorted(set("_".join(s.split("_")[:-1]) for s in self.samples))
-        self.breed_to_idx = {b: i for i, b in enumerate(breeds)}
 
     def __len__(self):
         return len(self.samples)
@@ -90,8 +92,7 @@ class OxfordIIITPetDataset(Dataset):
         bbox = torch.tensor([x_center, y_center, width, height], dtype=torch.float32)
 
         # LABEL
-        breed = "_".join(name.split("_")[:-1])
-        label = torch.tensor(self.breed_to_idx[breed])
+        label = torch.tensor(self.sample_to_label[name], dtype=torch.long)
 
         return {
             "image": image,
