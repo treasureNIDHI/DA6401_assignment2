@@ -3,12 +3,7 @@
 
 import torch
 import torch.nn as nn
-import os
-import sys
-try:
-    import gdown
-except ImportError:
-    gdown = None
+import gdown # pyright: ignore[reportMissingImports]
 from .layers import CustomDropout
 from .vgg11 import VGG11Encoder
 
@@ -162,6 +157,8 @@ class MultiTaskPerceptionModel(nn.Module):
     def __init__(self, num_breeds: int = 37, seg_classes: int = 3, in_channels: int = 3, classifier_path: str = "checkpoints/classifier.pth", localizer_path: str = "checkpoints/localizer.pth", unet_path: str = "checkpoints/unet.pth"):
         """
         Initialize the shared backbone/heads using these trained weights.
+        Downloads checkpoints from Google Drive if not present locally.
+        
         Args:
             num_breeds: Number of output classes for classification head.
             seg_classes: Number of output classes for segmentation head.
@@ -171,12 +168,35 @@ class MultiTaskPerceptionModel(nn.Module):
             unet_path: Path to trained unet weights.
         """
         super().__init__()
+        
+        # Drive IDs for checkpoint files
+        drive_ids = {
+            classifier_path: "1_D01Ldt-jrTMXYSe_vExxgslwJIUe71G",
+            localizer_path: "1EduqnUeDP86NBl8WlrSinlhL_foUz2z5",
+            unet_path: "1GSu2rTMvMwOsQVM92NKX0L0NmGzpt765",
+        }
+        
+        # Ensure all checkpoints are downloaded
+        for ckpt_path, drive_id in drive_ids.items():
+            if not os.path.exists(ckpt_path):
+                os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
+                if gdown is None:
+                    raise ImportError("gdown is required but not installed. Install with: pip install gdown")
+                try:
+                    print(f"[MultiTaskPerceptionModel] Downloading {os.path.basename(ckpt_path)}...")
+                    gdown.download(id=drive_id, output=ckpt_path, quiet=False)
+                except Exception as e:
+                    msg = f"CRITICAL: Failed to download {ckpt_path} from Google Drive.\nError: {e}\nMake sure you have internet access and gdown is installed."
+                    print(msg, file=sys.stderr)
+                    raise RuntimeError(msg) from e
 
+        # Build model architecture
         self.encoder = VGG11Encoder(in_channels)
         self.classifier_head = _ClassificationHead(num_breeds)
         self.localizer_head = _LocalizationHead()
         self.segmentation_head = _SegmentationDecoder(seg_classes)
 
+        # Load pretrained weights
         cls_state = _load_checkpoint_state(classifier_path)
         loc_state = _load_checkpoint_state(localizer_path)
         unet_state = _load_checkpoint_state(unet_path)
