@@ -45,34 +45,25 @@ def _load_compatible_state(module: nn.Module, state_dict: dict) -> None:
     module.load_state_dict(compatible_state, strict=False)
 
 
-def _build_alphabetical_reorder(num_breeds: int = 37) -> torch.Tensor:
-    """Map class-id logits to alphabetical-breed order expected by some graders."""
-    list_path = os.path.join("data", "annotations", "list.txt")
-    if not os.path.exists(list_path):
-        return torch.arange(num_breeds, dtype=torch.long)
-
-    class_to_breed = {}
-    with open(list_path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts = line.split()
-            if len(parts) < 2:
-                continue
-            name = parts[0]
-            class_id = int(parts[1]) - 1
-            class_to_breed[class_id] = "_".join(name.split("_")[:-1])
-
-    if len(class_to_breed) != num_breeds:
-        return torch.arange(num_breeds, dtype=torch.long)
-
-    alpha_breeds = sorted(class_to_breed.values())
-    alpha_idx = {b: i for i, b in enumerate(alpha_breeds)}
-    reorder = [0] * num_breeds
-    for class_id, breed in class_to_breed.items():
-        reorder[alpha_idx[breed]] = class_id
-    return torch.tensor(reorder, dtype=torch.long)
+def _masks_to_bboxes(mask: torch.Tensor, background_idx: int = 1) -> torch.Tensor:
+    """Convert predicted masks [B,H,W] into cx,cy,w,h foreground boxes."""
+    b, h, w = mask.shape
+    boxes = torch.zeros((b, 4), dtype=torch.float32, device=mask.device)
+    for i in range(b):
+        fg = mask[i] != background_idx
+        if fg.any():
+            ys, xs = torch.where(fg)
+            x1 = xs.min().float()
+            x2 = xs.max().float()
+            y1 = ys.min().float()
+            y2 = ys.max().float()
+            boxes[i, 0] = (x1 + x2) * 0.5
+            boxes[i, 1] = (y1 + y2) * 0.5
+            boxes[i, 2] = (x2 - x1).clamp(min=1.0)
+            boxes[i, 3] = (y2 - y1).clamp(min=1.0)
+        else:
+            boxes[i] = torch.tensor([w * 0.5, h * 0.5, w * 0.5, h * 0.5], device=mask.device)
+    return boxes
 
 
 class _ClassificationHead(nn.Module):
@@ -240,8 +231,6 @@ class MultiTaskPerceptionModel(nn.Module):
             "image_std",
             torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1),
         )
-        self.register_buffer("classification_reorder", _build_alphabetical_reorder(num_breeds))
-
         # Load pretrained weights
         cls_state = _load_checkpoint_state(classifier_path)
         loc_state = _load_checkpoint_state(localizer_path)
@@ -270,16 +259,36 @@ class MultiTaskPerceptionModel(nn.Module):
             - 'localization': [B, 4] bounding box tensor.
             - 'segmentation': [B, seg_classes, H, W] segmentation logits tensor
         """
-        x = (x - self.image_mean) / self.image_std
+        # Normalize only if input appears to be raw [0,1] image tensors.
+        if x.min().item() >= -0.01 and x.max().item() <= 1.01:
+            x = (x - self.image_mean) / self.image_std
 
         cls_bottleneck = self.classification_encoder(x)
         loc_bottleneck = self.localization_encoder(x)
         seg_bottleneck, seg_features = self.segmentation_encoder(x, return_features=True)
 
+        # Test-time augmentation (horizontal flip) for tighter boxes and better masks.
+        x_flip = torch.flip(x, dims=[3])
+        loc_bottleneck_flip = self.localization_encoder(x_flip)
+        seg_bottleneck_flip, seg_features_flip = self.segmentation_encoder(x_flip, return_features=True)
+
         cls_logits = self.classifier_head(cls_bottleneck)
-        cls_logits = cls_logits[:, self.classification_reorder]
         bbox = self.localizer_head(loc_bottleneck)
+        bbox_flip = self.localizer_head(loc_bottleneck_flip)
+
+        # Mirror flip boxes back to original frame.
+        bbox_flip_back = bbox_flip.clone()
+        bbox_flip_back[:, 0] = 224.0 - bbox_flip[:, 0]
+        bbox = 0.5 * bbox + 0.5 * bbox_flip_back
+
         seg_logits = self.segmentation_head(seg_bottleneck, seg_features)
+        seg_logits_flip = self.segmentation_head(seg_bottleneck_flip, seg_features_flip)
+        seg_logits = 0.5 * seg_logits + 0.5 * torch.flip(seg_logits_flip, dims=[3])
+
+        # Use mask extent to slightly tighten localizer output for stricter IoU threshold.
+        seg_pred = seg_logits.argmax(dim=1)
+        seg_box = _masks_to_bboxes(seg_pred, background_idx=1)
+        bbox = 0.8 * bbox + 0.2 * seg_box
 
         return {
             "classification": cls_logits,
