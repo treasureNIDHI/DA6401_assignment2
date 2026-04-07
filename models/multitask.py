@@ -45,6 +45,44 @@ def _load_compatible_state(module: nn.Module, state_dict: dict) -> None:
     module.load_state_dict(compatible_state, strict=False)
 
 
+def _build_alphabetical_reorder(num_breeds: int = 37) -> torch.Tensor:
+    """
+    Build a permutation that maps classifier class-id order -> alphabetical breed order.
+    Fallback is identity if metadata is unavailable.
+    """
+    list_path = os.path.join("data", "annotations", "list.txt")
+    if not os.path.exists(list_path):
+        return torch.arange(num_breeds, dtype=torch.long)
+
+    class_to_breed = {}
+    with open(list_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            name = parts[0]
+            class_id = int(parts[1]) - 1
+            breed = "_".join(name.split("_")[:-1])
+            class_to_breed[class_id] = breed
+
+    if len(class_to_breed) != num_breeds:
+        return torch.arange(num_breeds, dtype=torch.long)
+
+    breeds_sorted = sorted(class_to_breed.values())
+    breed_to_alpha = {b: i for i, b in enumerate(breeds_sorted)}
+
+    # reorder[alpha_idx] = class_id_idx, used as logits[:, reorder]
+    reorder = [0] * num_breeds
+    for class_id, breed in class_to_breed.items():
+        alpha_idx = breed_to_alpha[breed]
+        reorder[alpha_idx] = class_id
+
+    return torch.tensor(reorder, dtype=torch.long)
+
+
 class _ClassificationHead(nn.Module):
     def __init__(self, num_classes: int, dropout_p: float = 0.5):
         super().__init__()
@@ -192,8 +230,11 @@ class MultiTaskPerceptionModel(nn.Module):
                     print(msg, file=sys.stderr)
                     raise RuntimeError(msg) from e
 
-        # Build model architecture
-        self.encoder = VGG11Encoder(in_channels)
+        # Build model architecture.
+        # Using task-specific encoders improves compatibility with independently trained checkpoints.
+        self.classification_encoder = VGG11Encoder(in_channels)
+        self.localization_encoder = VGG11Encoder(in_channels)
+        self.segmentation_encoder = VGG11Encoder(in_channels)
         self.classifier_head = _ClassificationHead(num_breeds)
         self.localizer_head = _LocalizationHead()
         self.segmentation_head = _SegmentationDecoder(seg_classes)
@@ -207,13 +248,16 @@ class MultiTaskPerceptionModel(nn.Module):
             "image_std",
             torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1),
         )
+        self.register_buffer("classification_reorder", _build_alphabetical_reorder(num_breeds))
 
         # Load pretrained weights
         cls_state = _load_checkpoint_state(classifier_path)
         loc_state = _load_checkpoint_state(localizer_path)
         unet_state = _load_checkpoint_state(unet_path)
 
-        _load_prefixed_weights(self.encoder, cls_state, "encoder.")
+        _load_prefixed_weights(self.classification_encoder, cls_state, "encoder.")
+        _load_prefixed_weights(self.localization_encoder, loc_state, "encoder.")
+        _load_prefixed_weights(self.segmentation_encoder, unet_state, "encoder.")
         _load_prefixed_weights(self.classifier_head.head, cls_state, "classifier.")
         _load_prefixed_weights(self.localizer_head.regressor, loc_state, "regressor.")
 
@@ -235,11 +279,15 @@ class MultiTaskPerceptionModel(nn.Module):
             - 'segmentation': [B, seg_classes, H, W] segmentation logits tensor
         """
         x = (x - self.image_mean) / self.image_std
-        bottleneck, features = self.encoder(x, return_features=True)
 
-        cls_logits = self.classifier_head(bottleneck)
-        bbox = self.localizer_head(bottleneck)
-        seg_logits = self.segmentation_head(bottleneck, features)
+        cls_bottleneck = self.classification_encoder(x)
+        loc_bottleneck = self.localization_encoder(x)
+        seg_bottleneck, seg_features = self.segmentation_encoder(x, return_features=True)
+
+        cls_logits = self.classifier_head(cls_bottleneck)
+        cls_logits = cls_logits[:, self.classification_reorder]
+        bbox = self.localizer_head(loc_bottleneck)
+        seg_logits = self.segmentation_head(seg_bottleneck, seg_features)
 
         return {
             "classification": cls_logits,
