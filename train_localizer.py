@@ -27,6 +27,18 @@ def load_checkpoint(path: str, map_location: torch.device):
     return checkpoint
 
 
+def load_encoder_weights(encoder: nn.Module, state_dict: dict) -> None:
+    encoder_state = encoder.state_dict()
+    filtered = {
+        key[len("encoder."):]: value
+        for key, value in state_dict.items()
+        if key.startswith("encoder.")
+        and key[len("encoder."):] in encoder_state
+        and encoder_state[key[len("encoder."):]].shape == value.shape
+    }
+    encoder.load_state_dict(filtered, strict=False)
+
+
 def seed_everything(seed: int = 42):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
@@ -76,20 +88,20 @@ def train():
 
     # load pretrained encoder
     checkpoint = load_checkpoint("checkpoints/classifier.pth", map_location=device)
-    model.encoder.load_state_dict(checkpoint, strict=False)
+    load_encoder_weights(model.encoder, checkpoint)
 
     # -----------------------------
     # LOSS (MSE + IoU)
     # -----------------------------
     criterion_iou = IoULoss()
-    criterion_mse = nn.MSELoss()
+    criterion_reg = nn.SmoothL1Loss(beta=1.0)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=15, eta_min=1e-6)
     use_amp = device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
-    epochs = 15
+    epochs = 25
     best_loss = float("inf")
 
     for epoch in range(epochs):
@@ -112,9 +124,10 @@ def train():
                 preds = torch.clamp(preds, min=0, max=224)
 
                 loss_iou = criterion_iou(preds, bboxes)
-                loss_mse = criterion_mse(preds, bboxes)
+                loss_reg = criterion_reg(preds / 224.0, bboxes / 224.0)
 
-                loss = loss_mse + loss_iou
+                # IoU term needs a larger weight because normalized reg loss is small.
+                loss = 5.0 * loss_iou + loss_reg
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -141,9 +154,9 @@ def train():
                     preds = model(images)
                     preds = torch.clamp(preds, min=0, max=224)
                     loss_iou = criterion_iou(preds, bboxes)
-                    loss_mse = criterion_mse(preds, bboxes)
+                    loss_reg = criterion_reg(preds / 224.0, bboxes / 224.0)
 
-                    loss = loss_mse + loss_iou
+                    loss = 5.0 * loss_iou + loss_reg
 
                 val_loss += loss.item()
 

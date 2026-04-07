@@ -29,6 +29,18 @@ def load_checkpoint(path: str, map_location: torch.device):
     return checkpoint
 
 
+def load_encoder_weights(encoder: nn.Module, state_dict: dict) -> None:
+    encoder_state = encoder.state_dict()
+    filtered = {
+        key[len("encoder."):]: value
+        for key, value in state_dict.items()
+        if key.startswith("encoder.")
+        and key[len("encoder."):] in encoder_state
+        and encoder_state[key[len("encoder."):]].shape == value.shape
+    }
+    encoder.load_state_dict(filtered, strict=False)
+
+
 def seed_everything(seed: int = 42):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
@@ -88,7 +100,7 @@ def train():
     model = VGG11UNet().to(device)
 
     checkpoint = load_checkpoint("checkpoints/classifier.pth", map_location=device)
-    model.encoder.load_state_dict(checkpoint, strict=False)
+    load_encoder_weights(model.encoder, checkpoint)
 
     # -----------------------------
     # TRANSFER LEARNING STRATEGY
@@ -112,14 +124,17 @@ def train():
     # -----------------------------
     # LOSS
     # -----------------------------
-    criterion_ce = nn.CrossEntropyLoss()
+    # Background-heavy masks: downweight background to improve macro-dice.
+    criterion_ce = nn.CrossEntropyLoss(
+        weight=torch.tensor([0.3, 1.0, 1.0], device=device)
+    )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=15, eta_min=1e-6)
     use_amp = device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
-    epochs = 15
+    epochs = 25
     best_loss = float("inf")
 
     # -----------------------------
@@ -147,13 +162,18 @@ def train():
             images = normalize_images(batch["image"].to(device))
             masks = batch["mask"].long().to(device)
 
+            # Keep image/mask aligned for segmentation augmentation.
+            if torch.rand(1).item() < 0.5:
+                images = torch.flip(images, dims=[3])
+                masks = torch.flip(masks, dims=[2])
+
             optimizer.zero_grad(set_to_none=True)
 
             with torch.amp.autocast("cuda", enabled=use_amp):
                 preds = model(images)
                 loss_ce = criterion_ce(preds, masks)
                 loss_dice = multiclass_dice_loss(preds, masks, num_classes=3)
-                loss = loss_ce + loss_dice
+                loss = 0.5 * loss_ce + 1.5 * loss_dice
 
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -175,7 +195,7 @@ def train():
                 preds = model(images)
                 loss_ce = criterion_ce(preds, masks)
                 loss_dice = multiclass_dice_loss(preds, masks, num_classes=3)
-                loss = loss_ce + loss_dice
+                loss = 0.5 * loss_ce + 1.5 * loss_dice
 
                 val_loss += loss.item()
 

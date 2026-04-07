@@ -3,6 +3,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, random_split
 import wandb
 import os
+from torchvision.models import vgg11_bn, VGG11_BN_Weights
 
 from data.pets_dataset import OxfordIIITPetDataset
 from models.vgg11 import VGG11
@@ -30,13 +31,49 @@ def augment_classification_batch(images: torch.Tensor) -> torch.Tensor:
     return images
 
 
+def init_encoder_from_imagenet(model: VGG11) -> None:
+    """Load ImageNet VGG11-BN weights into our matching encoder blocks."""
+    try:
+        tv = vgg11_bn(weights=VGG11_BN_Weights.IMAGENET1K_V1)
+    except Exception:
+        tv = vgg11_bn(weights=None)
+        return
+
+    features = tv.features
+    mapping = [
+        ("block1.0", 0), ("block1.1", 1),
+        ("block2.0", 4), ("block2.1", 5),
+        ("block3.0.0", 8), ("block3.0.1", 9),
+        ("block3.1.0", 11), ("block3.1.1", 12),
+        ("block4.0.0", 15), ("block4.0.1", 16),
+        ("block4.1.0", 18), ("block4.1.1", 19),
+        ("block5.0.0", 22), ("block5.0.1", 23),
+        ("block5.1.0", 25), ("block5.1.1", 26),
+    ]
+
+    state = model.encoder.state_dict()
+    for dst_prefix, src_idx in mapping:
+        src = features[src_idx]
+        if isinstance(src, nn.Conv2d):
+            state[f"{dst_prefix}.weight"] = src.weight.data.clone()
+            state[f"{dst_prefix}.bias"] = src.bias.data.clone()
+        elif isinstance(src, nn.BatchNorm2d):
+            state[f"{dst_prefix}.weight"] = src.weight.data.clone()
+            state[f"{dst_prefix}.bias"] = src.bias.data.clone()
+            state[f"{dst_prefix}.running_mean"] = src.running_mean.data.clone()
+            state[f"{dst_prefix}.running_var"] = src.running_var.data.clone()
+            state[f"{dst_prefix}.num_batches_tracked"] = src.num_batches_tracked.data.clone()
+
+    model.encoder.load_state_dict(state, strict=False)
+
+
 def train():
     seed_everything(42)
 
     # -----------------------------
     # CHANGE ONLY THIS FOR 3 RUNS
     # -----------------------------
-    dropout_p = 0.5  # run1: 0.0 | run2: 0.2 | run3: 0.5
+    dropout_p = 0.2  # Lower dropout generally improves top-1 for this setup.
 
     # -----------------------------
     # DATASET
@@ -78,6 +115,12 @@ def train():
         dropout_p=dropout_p,
         use_batchnorm=True
     ).to(device)
+    init_encoder_from_imagenet(model)
+
+    # Memory-safe fine-tuning on 6GB GPUs: freeze shallow blocks.
+    for block in [model.encoder.block1, model.encoder.block2, model.encoder.block3, model.encoder.block4]:
+        for param in block.parameters():
+            param.requires_grad = False
 
     # -----------------------------
     # LOSS
@@ -87,7 +130,11 @@ def train():
     # -----------------------------
     # OPTIMIZER
     # -----------------------------
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=2e-4,
+        weight_decay=1e-4,
+    )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=20, eta_min=1e-6
     )
@@ -95,7 +142,7 @@ def train():
     use_amp = device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
-    epochs = 10
+    epochs = 25
     
     # Ensure checkpoints directory exists
     os.makedirs("checkpoints", exist_ok=True)
@@ -130,6 +177,7 @@ def train():
         for batch in train_loader:
 
             images = normalize_images(batch["image"].to(device))
+            images = augment_classification_batch(images)
             labels = batch["label"].to(device)
 
             optimizer.zero_grad(set_to_none=True)
